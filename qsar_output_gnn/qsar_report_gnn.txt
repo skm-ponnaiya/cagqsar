@@ -1,0 +1,22 @@
+==================================================
+                QSAR MODEL REPORT
+==================================================
+Dataset Size:           1066 compounds
+Model Algorithm:        GNN
+Data Splitting:         PCA (Train: 853, Test: 213)
+Descriptors in Model (k): 0
+Degree of Freedom (df):   852
+--------------------------------------------------
+Training R2:            0.5752
+Cross-Validated Q2:      0.3382
+External Test Pred_R2:  0.5715
+Standard Error (SEE):   0.6058
+F-Test Statistic:       0.0000
+Alpha Error Prob (F):   1.0000e+00
+--------------------------------------------------
+Y-RANDOMIZATION VALIDATION:
+Best Randomized R2:     0.0180
+Best Randomized Q2:     -0.0197
+Z-score:                5.1224
+Alpha Significance:     0.0000
+==================================================

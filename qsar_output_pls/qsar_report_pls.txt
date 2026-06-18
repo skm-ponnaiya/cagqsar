@@ -1,0 +1,22 @@
+==================================================
+                QSAR MODEL REPORT
+==================================================
+Dataset Size:           1066 compounds
+Model Algorithm:        PLS
+Data Splitting:         PCA (Train: 853, Test: 213)
+Descriptors in Model (k): 59
+Degree of Freedom (df):   793
+--------------------------------------------------
+Training R2:            0.6136
+Cross-Validated Q2:      0.5602
+External Test Pred_R2:  0.5012
+Standard Error (SEE):   0.5974
+F-Test Statistic:       21.3428
+Alpha Error Prob (F):   3.3511e-126
+--------------------------------------------------
+Y-RANDOMIZATION VALIDATION:
+Best Randomized R2:     0.0746
+Best Randomized Q2:     -0.0502
+Z-score:                60.2800
+Alpha Significance:     0.0000
+==================================================

@@ -39,11 +39,5 @@ env/
 .project
 .pydevproject
 
-# QSAR output files and test artifacts
-qsar_output/
-qsar_output_*/
-cleaned_dataset.csv
-*.png
-*.pkl
-*.txt
+# QSAR output logs and temporary files
 *.log
