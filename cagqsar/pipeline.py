@@ -755,15 +755,123 @@ def plot_qsar_results(y_train, train_pred, y_test, test_pred, model_name, output
     print(f"Plot saved to: {plot_path}")
 
 
+def run_prediction(predict_csv, model_path, smiles_col, out_dir):
+    print(f"Loading trained QSAR model from: {model_path}...")
+    try:
+        with open(model_path, 'rb') as f:
+            model_data = pickle.load(f)
+    except Exception as e:
+        print(f"Error loading model file: {e}")
+        sys.exit(1)
+        
+    if not isinstance(model_data, dict) or 'model_object' not in model_data:
+        print("Error: The selected model file does not contain a valid QSAR pipeline state.")
+        print("Note: Models must be trained with cagqsar to support prediction mode.")
+        sys.exit(1)
+        
+    model_object = model_data['model_object']
+    model_name = model_data['model_name']
+    selected_features = model_data.get('selected_features', None)
+    use_fingerprints = model_data.get('use_fingerprints', False)
+    
+    print(f"Successfully loaded {model_name.upper()} model pipeline.")
+    
+    print(f"Reading prediction compounds from: {predict_csv}...")
+    try:
+        df = pd.read_csv(predict_csv)
+    except Exception as e:
+        print(f"Error reading prediction file: {e}")
+        sys.exit(1)
+        
+    if smiles_col not in df.columns:
+        print(f"Error: SMILES column '{smiles_col}' not found in the prediction CSV file.")
+        sys.exit(1)
+        
+    # Curate chemical structures
+    remover = SaltRemover()
+    cleaned_smiles_list = []
+    mol_objects = []
+    valid_indices = []
+    
+    for idx, row in df.iterrows():
+        smiles = row[smiles_col]
+        clean_smiles, mol = curate_molecule(smiles, remover)
+        if mol is not None:
+            cleaned_smiles_list.append(clean_smiles)
+            mol_objects.append(mol)
+            valid_indices.append(idx)
+            
+    if not mol_objects:
+        print("Error: No valid chemical structures found in the prediction file after curation.")
+        sys.exit(1)
+        
+    print(f"Curated {len(mol_objects)} / {len(df)} compounds successfully.")
+    
+    # Subset dataframe to valid rows
+    pred_df = df.iloc[valid_indices].copy()
+    pred_df['Clean_SMILES'] = cleaned_smiles_list
+    pred_df['MolObject'] = mol_objects
+    
+    # Perform prediction based on model type
+    if model_name != 'gnn':
+        print("Generating molecular descriptors for predictions...")
+        desc_df = generate_descriptors(pred_df, use_fingerprints=use_fingerprints)
+        
+        # Align features
+        missing_features = [f for f in selected_features if f not in desc_df.columns]
+        if missing_features:
+            for f in missing_features:
+                desc_df[f] = 0.0
+        X = desc_df[selected_features]
+        
+        # Predict
+        preds = model_object.predict(X)
+        if len(preds.shape) > 1 and preds.shape[1] == 1:
+            preds = preds.squeeze(-1)
+    else:
+        if not TORCH_AVAILABLE:
+            print("Error: PyTorch is required to run predictions with the GNN model.")
+            sys.exit(1)
+        print("Running GNN forward pass predictions...")
+        pred_df['pActivity'] = 0.0  # Dummy label needed for loader
+        preds = predict_gnn(model_object, pred_df)
+        
+    # Append predictions
+    pred_df['Predicted_pIC50'] = preds
+    pred_df['Predicted_IC50_nM'] = 10 ** (9.0 - preds)
+    
+    # Remove temporary MolObject column
+    pred_df = pred_df.drop(columns=['MolObject'])
+    
+    # Save output
+    os.makedirs(out_dir, exist_ok=True)
+    out_filename = os.path.basename(predict_csv).replace('.csv', '_predicted.csv')
+    out_path = os.path.join(out_dir, out_filename)
+    pred_df.to_csv(out_path, index=False)
+    
+    print("\n" + "="*50)
+    print("               PREDICTION REPORT")
+    print("="*50)
+    print(f"Input File:          {predict_csv}")
+    print(f"Model Algorithm:     {model_name.upper()}")
+    print(f"Output File Saved:   {out_path}")
+    print("-"*50)
+    print("Sample Predictions:")
+    for i, (idx, row) in enumerate(pred_df.head(5).iterrows()):
+        print(f"  {i+1}. SMILES: {row['Clean_SMILES'][:40]}... -> pIC50: {row['Predicted_pIC50']:.4f} ({row['Predicted_IC50_nM']:.2f} nM)")
+    print("="*50 + "\n")
+
+
 # ==========================================
 # CLI MAIN ENTRY
 # ==========================================
 
 def main():
     parser = argparse.ArgumentParser(description="Complete QSAR Pipeline Command Line Software")
-    parser.add_argument('--data', type=str, required=True, help="Path to raw CSV dataset")
-    parser.add_argument('--smiles', type=str, required=True, help="Column name containing SMILES strings")
-    parser.add_argument('--activity', type=str, required=True, help="Column name containing activity values (nM)")
+    # Training arguments
+    parser.add_argument('--data', type=str, help="Path to raw CSV dataset")
+    parser.add_argument('--smiles', type=str, help="Column name containing SMILES strings")
+    parser.add_argument('--activity', type=str, help="Column name containing activity values (nM)")
     parser.add_argument('--model', type=str, default='pls', 
                         choices=['mlr', 'pls', 'rf', 'svr', 'xgb', 'gnn'], 
                         help="Model selection: mlr, pls, rf, svr, xgb, gnn")
@@ -777,8 +885,29 @@ def main():
     parser.add_argument('--fingerprints', action='store_true', help="Use 2D fingerprints (Morgan + MACCS)")
     parser.add_argument('--out_dir', type=str, default='qsar_output', help="Directory to save output files and plots")
     
+    # Prediction arguments
+    parser.add_argument('--predict', type=str, help="Path to CSV file containing new compounds to predict")
+    parser.add_argument('--model_path', type=str, help="Path to the trained QSAR model (.pkl file)")
+    
     args = parser.parse_args()
     
+    # Handle Prediction Mode
+    if args.predict:
+        if not args.model_path:
+            print("Error: --model_path is required when running in prediction mode.")
+            sys.exit(1)
+        if not args.smiles:
+            print("Error: --smiles column name is required to parse the prediction CSV.")
+            sys.exit(1)
+        run_prediction(args.predict, args.model_path, args.smiles, args.out_dir)
+        sys.exit(0)
+        
+    # Handle Training Mode (Default)
+    if not args.data or not args.smiles or not args.activity:
+        print("Error: For training a new model, --data, --smiles, and --activity are all required.")
+        print("To predict new compounds instead, use: cagqsar --predict <csv_file> --model_path <pkl_file> --smiles <column>")
+        sys.exit(1)
+        
     # Check PyTorch dependency for GNN
     if args.model == 'gnn' and not TORCH_AVAILABLE:
         print("Error: PyTorch is not installed. GNN model cannot be run. Please install PyTorch first.")
@@ -852,11 +981,17 @@ def main():
         train_df=train_df_sub, test_df=test_df_sub, k=k_count, y_rand_runs=args.y_rand_runs
     )
     
-    # Save the trained model file
+    # Save the trained model file (dictionary state)
     model_path = os.path.join(args.out_dir, f"qsar_model_{args.model}.pkl")
+    model_data = {
+        'model_object': model_object,
+        'model_name': args.model,
+        'selected_features': X_selected.columns.tolist() if args.model != 'gnn' else None,
+        'use_fingerprints': args.fingerprints
+    }
     with open(model_path, 'wb') as f:
-        pickle.dump(model_object, f)
-    print(f"Trained model saved to: {model_path}")
+        pickle.dump(model_data, f)
+    print(f"Trained model pipeline state saved to: {model_path}")
     
     # Step 7: Plot predicted vs experimental scatter plots
     plot_qsar_results(y_train, train_pred, y_test, test_pred, args.model, args.out_dir)
