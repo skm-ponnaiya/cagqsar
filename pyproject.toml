@@ -1,0 +1,34 @@
+[build-system]
+requires = ["setuptools>=61.0.0", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "cagqsar"
+version = "1.0.0"
+description = "A complete CLI QSAR pipeline for drug discovery and predictive toxicology"
+readme = "README.md"
+authors = [
+    { name = "Sathish Kumar M Ponnaiya" }
+]
+requires-python = ">=3.8"
+classifiers = [
+    "Programming Language :: Python :: 3",
+    "Operating System :: POSIX :: Linux",
+    "Intended Audience :: Science/Research",
+    "Topic :: Scientific/Engineering :: Chemistry"
+]
+dependencies = [
+    "numpy",
+    "pandas",
+    "scipy",
+    "scikit-learn",
+    "xgboost",
+    "matplotlib",
+    "rdkit"
+]
+
+[project.scripts]
+cagqsar = "cagqsar.pipeline:main"
+
+[tool.setuptools]
+packages = ["cagqsar"]
