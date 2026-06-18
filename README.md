@@ -15,25 +15,34 @@ sudo apt update
 sudo apt install python3 python3-pip python3-venv -y
 ```
 
-### Option A: Global System-Wide Install (Recommended for Linux/WSL)
-You can install the tool system-wide so that any user can run the `cagqsar` command directly:
+### Option A: Install from PyPI (Once Published)
+After publishing the package to PyPI, you can create a virtual environment and install the tool globally or locally using `pip`:
 ```bash
-# Clone the repository, navigate into it, and run:
-sudo chmod +x install.sh
-sudo ./install.sh
-```
-This script creates a virtual environment inside `/opt/cagqsar`, installs all prerequisites (RDKit, PyTorch CPU, XGBoost, etc.), and sets up a symbolic link under `/usr/local/bin/cagqsar`. Once installed, simply call:
-```bash
+# 1. Create a virtual environment
+python3 -m venv qsar_env
+source qsar_env/bin/activate
+
+# 2. Install the package from PyPI
+pip install cagqsar
+
+# 3. Run the CLI tool
 cagqsar --help
 ```
 
-### Option B: Local User Install
-If you do not have root (`sudo`) access:
+### Option B: Local Source Install (No root access required)
+You can build and install the package locally from the repository folder:
 ```bash
-pip install --user .
-```
-This registers the package in your user folder. Ensure that `~/.local/bin` is added to your shell `$PATH`. You can run it using:
-```bash
+# 1. Navigate to the repository directory
+cd git_qsar
+
+# 2. Create and activate a virtual environment
+python3 -m venv qsar_env
+source qsar_env/bin/activate
+
+# 3. Install the package locally
+pip install .
+
+# 4. Run the CLI tool
 cagqsar --help
 ```
 
