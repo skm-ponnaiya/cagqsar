@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cagqsar"
-version = "1.2.0"
+version = "1.2.2"
 description = "A complete CLI QSAR pipeline for drug discovery and predictive toxicology"
 readme = "README.md"
 authors = [

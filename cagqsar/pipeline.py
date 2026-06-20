@@ -1124,6 +1124,12 @@ if TORCH_AVAILABLE:
             return np.array(preds)
         else:
             raise ValueError(f"Unknown DL model type: {model_type}")
+else:
+    def train_3d_dl(*args, **kwargs):
+        raise ImportError("PyTorch is required for 3D deep learning models. Please install it using: pip install cagqsar[torch] or pip install torch")
+
+    def predict_3d_dl(*args, **kwargs):
+        raise ImportError("PyTorch is required for 3D deep learning models. Please install it using: pip install cagqsar[torch] or pip install torch")
 
 
 # ==========================================
