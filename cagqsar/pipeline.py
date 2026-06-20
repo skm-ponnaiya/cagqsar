@@ -10,7 +10,7 @@ from scipy import stats
 
 # RDKit imports
 from rdkit import Chem
-from rdkit.Chem import Descriptors, rdMolDescriptors
+from rdkit.Chem import Descriptors, rdMolDescriptors, AllChem, rdMolAlign, rdFMCS
 from rdkit.Chem.SaltRemover import SaltRemover
 
 # Scikit-learn imports
@@ -135,6 +135,96 @@ def curate_dataset(df, smiles_col, activity_col):
 
 
 # ==========================================
+# 1.1. 3D CONFORMER GENERATION & ALIGNMENT (For 3D QSAR)
+# ==========================================
+
+def generate_3d_conformer(mol):
+    """
+    Generates a single low-energy 3D conformer for a molecule.
+    Steps:
+      1. Add explicit hydrogens.
+      2. Embed molecule using ETKDGv3 (fallback to ETKDGv2/ETKDG).
+      3. Optimize using MMFF94 force field (fallback to UFF).
+    """
+    if mol is None:
+        return None
+    try:
+        # Add explicit hydrogens
+        mol_h = Chem.AddHs(mol)
+        
+        # Conformer embedding parameters
+        if hasattr(AllChem, 'ETKDGv3'):
+            params = AllChem.ETKDGv3()
+        elif hasattr(AllChem, 'ETKDGv2'):
+            params = AllChem.ETKDGv2()
+        else:
+            params = AllChem.ETKDG()
+            
+        params.randomSeed = 42
+        
+        # Embed
+        res = AllChem.EmbedMolecule(mol_h, params)
+        if res < 0:
+            # Fallback to standard embedding
+            res = AllChem.EmbedMolecule(mol_h, randomSeed=42, maxAttempts=200)
+        if res < 0:
+            # Fallback with random coordinates
+            params_fallback = AllChem.ETKDG()
+            params_fallback.useRandomCoords = True
+            params_fallback.randomSeed = 42
+            res = AllChem.EmbedMolecule(mol_h, params_fallback)
+            
+        if res >= 0:
+            try:
+                # MMFF94 Optimization
+                if AllChem.MMFFHasAllMoleculeParams(mol_h):
+                    AllChem.MMFFOptimizeMolecule(mol_h, maxIters=500)
+                else:
+                    AllChem.UFFOptimizeMolecule(mol_h, maxIters=500)
+            except Exception:
+                pass
+            return mol_h
+        else:
+            return None
+    except Exception:
+        return None
+
+def align_molecules_3d(mols, ref_mol):
+    """
+    Aligns a list of molecules (with 3D conformers and Hs) to the reference molecule `ref_mol` in-place.
+    Uses pairwise Maximum Common Substructure (MCS) to align to reference molecule.
+    """
+    aligned_mols = []
+    if ref_mol is None:
+        return mols
+        
+    for mol in mols:
+        if mol is None:
+            aligned_mols.append(None)
+            continue
+        try:
+            # If same chemical structure, bypass MCS
+            if mol.GetNumAtoms() == ref_mol.GetNumAtoms() and Chem.MolToSmiles(mol) == Chem.MolToSmiles(ref_mol):
+                aligned_mols.append(mol)
+                continue
+                
+            # Pairwise MCS
+            mcs = rdFMCS.FindMCS([mol, ref_mol], timeout=1)
+            if mcs.numAtoms >= 3:
+                core = Chem.MolFromSmarts(mcs.smartsString)
+                if core is not None:
+                    ref_matches = ref_mol.GetSubstructMatches(core)
+                    mol_matches = mol.GetSubstructMatches(core)
+                    if ref_matches and mol_matches:
+                        atom_map = list(zip(mol_matches[0], ref_matches[0]))
+                        rdMolAlign.AlignMol(mol, ref_mol, atomMap=atom_map)
+            aligned_mols.append(mol)
+        except Exception:
+            aligned_mols.append(mol)
+    return aligned_mols
+
+
+# ==========================================
 # 2. MOLECULAR DESCRIPTORS
 # ==========================================
 
@@ -197,6 +287,217 @@ def generate_descriptors(df, use_fingerprints=True):
     features_df = features_df.fillna(0.0)
     print(f"Total descriptors generated: {features_df.shape[1]}")
     return features_df
+
+
+# ------------------------------------------
+# 3D QSAR DESCRIPTOR ENGINES
+# ------------------------------------------
+
+def compute_gasteiger_charges(mol):
+    """
+    Computes Gasteiger partial charges using RDKit.
+    Returns a list of charges, or 0.0 fallback for NaNs/errors.
+    """
+    try:
+        Chem.rdPartialCharges.ComputeGasteigerCharges(mol)
+        charges = []
+        for atom in mol.GetAtoms():
+            try:
+                val = atom.GetDoubleProp('_GasteigerCharge')
+                if np.isnan(val) or np.isinf(val):
+                    val = 0.0
+                charges.append(val)
+            except Exception:
+                charges.append(0.0)
+        return charges
+    except Exception:
+        return [0.0] * mol.GetNumAtoms()
+
+def define_grid(mols, padding=4.0, spacing=2.0):
+    """
+    Finds the union bounding box of all conformers in mols and generates grid coordinates.
+    """
+    all_coords = []
+    for mol in mols:
+        if mol is not None:
+            try:
+                conf = mol.GetConformer()
+                all_coords.append(conf.GetPositions())
+            except Exception:
+                pass
+    if not all_coords:
+        raise ValueError("No conformers found to construct grid bounding box.")
+    
+    all_coords = np.concatenate(all_coords, axis=0)
+    min_xyz = np.min(all_coords, axis=0) - padding
+    max_xyz = np.max(all_coords, axis=0) + padding
+    
+    # Create grid steps
+    xs = np.arange(min_xyz[0], max_xyz[0] + 1e-5, spacing)
+    ys = np.arange(min_xyz[1], max_xyz[1] + 1e-5, spacing)
+    zs = np.arange(min_xyz[2], max_xyz[2] + 1e-5, spacing)
+    
+    grid_shape = (len(zs), len(ys), len(xs))
+    
+    # Generate coordinates in (Z, Y, X) order for easy 3D reshaping
+    grid_coords = []
+    for z in zs:
+        for y in ys:
+            for x in xs:
+                grid_coords.append([x, y, z])
+    grid_coords = np.array(grid_coords, dtype=np.float32)
+    
+    grid_bounds = {
+        'min_xyz': min_xyz.tolist(),
+        'max_xyz': max_xyz.tolist(),
+        'spacing': spacing,
+        'grid_shape': grid_shape,
+        'xs': xs.tolist(),
+        'ys': ys.tolist(),
+        'zs': zs.tolist()
+    }
+    return grid_coords, grid_shape, grid_bounds
+
+def reconstruct_grid(grid_bounds):
+    xs = np.array(grid_bounds['xs'])
+    ys = np.array(grid_bounds['ys'])
+    zs = np.array(grid_bounds['zs'])
+    grid_coords = []
+    for z in zs:
+        for y in ys:
+            for x in xs:
+                grid_coords.append([x, y, z])
+    return np.array(grid_coords, dtype=np.float32)
+
+def compute_grid_fields_for_mol(mol, grid_coords, charges):
+    """
+    Computes Lennard-Jones (steric) and Coulombic (electrostatic) potentials at grid_coords.
+    Caps potentials at +30.0 kcal/mol and ±30.0 kcal/mol respectively.
+    """
+    conf = mol.GetConformer()
+    pos = conf.GetPositions()
+    
+    vdw_radii = []
+    vdw_eps = []
+    for atom in mol.GetAtoms():
+        elem = atom.GetSymbol()
+        r, eps = 1.70, 0.070  # Default C
+        if elem == 'H':
+            r, eps = 1.20, 0.030
+        elif elem == 'N':
+            r, eps = 1.55, 0.070
+        elif elem == 'O':
+            r, eps = 1.52, 0.070
+        elif elem == 'F':
+            r, eps = 1.47, 0.075
+        elif elem == 'P':
+            r, eps = 1.80, 0.150
+        elif elem == 'S':
+            r, eps = 1.80, 0.150
+        elif elem == 'Cl':
+            r, eps = 1.75, 0.150
+        elif elem == 'Br':
+            r, eps = 1.85, 0.200
+        elif elem == 'I':
+            r, eps = 1.98, 0.250
+        vdw_radii.append(r)
+        vdw_eps.append(eps)
+        
+    vdw_radii = np.array(vdw_radii)
+    vdw_eps = np.array(vdw_eps)
+    charges = np.array(charges)
+    
+    r_probe = 1.70
+    eps_probe = 0.070
+    q_probe = 1.0
+    
+    diff = pos[:, np.newaxis, :] - grid_coords[np.newaxis, :, :]  # (N_atoms, N_grid, 3)
+    dists = np.sqrt(np.sum(diff ** 2, axis=2))  # (N_atoms, N_grid)
+    dists = np.maximum(dists, 0.8)  # Cap distance to avoid division by zero
+    
+    r0 = vdw_radii[:, np.newaxis] + r_probe
+    eps_ip = np.sqrt(vdw_eps[:, np.newaxis] * eps_probe)
+    ratio = r0 / dists
+    ratio_6 = ratio ** 6
+    ratio_12 = ratio_6 ** 2
+    steric_pot = eps_ip * (ratio_12 - 2 * ratio_6)
+    steric = np.sum(steric_pot, axis=0)
+    
+    elec_pot = (charges[:, np.newaxis] * q_probe / dists) * 332.0637
+    elec = np.sum(elec_pot, axis=0)
+    
+    steric = np.clip(steric, -30.0, 30.0)
+    elec = np.clip(elec, -30.0, 30.0)
+    
+    return steric, elec
+
+def get_grid_free_3d_descriptors(mol):
+    """
+    Generates standard RDKit 3D descriptors: RDF, 3D-MoRSE, WHIM, GETAWAY.
+    """
+    desc = {}
+    if mol is None:
+        return desc
+    try:
+        rdf = rdMolDescriptors.CalcRDF(mol)
+        for i, val in enumerate(rdf):
+            desc[f"RDF_{i}"] = float(val) if not (np.isnan(val) or np.isinf(val)) else 0.0
+    except Exception:
+        pass
+    try:
+        morse = rdMolDescriptors.Calc3DMoRSE(mol)
+        for i, val in enumerate(morse):
+            desc[f"MoRSE_{i}"] = float(val) if not (np.isnan(val) or np.isinf(val)) else 0.0
+    except Exception:
+        pass
+    try:
+        whim = rdMolDescriptors.CalcWHIM(mol)
+        for i, val in enumerate(whim):
+            desc[f"WHIM_{i}"] = float(val) if not (np.isnan(val) or np.isinf(val)) else 0.0
+    except Exception:
+        pass
+    try:
+        getaway = rdMolDescriptors.CalcGETAWAY(mol)
+        for i, val in enumerate(getaway):
+            desc[f"GETAWAY_{i}"] = float(val) if not (np.isnan(val) or np.isinf(val)) else 0.0
+    except Exception:
+        pass
+    return desc
+
+def generate_3d_descriptors(df, grid_coords, include_grid_free=True):
+    """
+    Calculates 3D grid potentials and grid-free descriptors for all molecules in dataframe.
+    Returns a dataframe of combined 3D descriptors, and X_grid_voxels (for 3D CNN).
+    """
+    print("Calculating 3D descriptors...")
+    features = []
+    voxel_list = []
+    
+    for idx, row in df.iterrows():
+        mol = row['MolObject']
+        charges = compute_gasteiger_charges(mol)
+        steric, elec = compute_grid_fields_for_mol(mol, grid_coords, charges)
+        
+        desc = {}
+        for i in range(len(steric)):
+            desc[f"Steric_Grid_{i}"] = float(steric[i])
+            desc[f"Elec_Grid_{i}"] = float(elec[i])
+            
+        voxel_list.append(np.stack([steric, elec], axis=0))
+        
+        if include_grid_free:
+            grid_free = get_grid_free_3d_descriptors(mol)
+            desc.update(grid_free)
+            
+        features.append(desc)
+        
+    features_df = pd.DataFrame(features)
+    features_df.index = df.index
+    features_df = features_df.fillna(0.0)
+    
+    X_grid_voxels = np.array(voxel_list, dtype=np.float32)
+    
+    return features_df, X_grid_voxels
 
 
 # ==========================================
@@ -556,12 +857,280 @@ if TORCH_AVAILABLE:
                 preds.extend(pred.cpu().numpy().tolist())
         return np.array(preds)
 
+    # ------------------------------------------
+    # 3D DEEP LEARNING MODELS (PyTorch)
+    # ------------------------------------------
+
+    class Bio3DDataset(Dataset):
+        def __init__(self, df):
+            self.data = []
+            for idx, row in df.iterrows():
+                try:
+                    mol = row['MolObject']
+                    if mol is not None:
+                        x = [get_atom_features(atom) for atom in mol.GetAtoms()]
+                        x = np.array(x, dtype=np.float32)
+                        
+                        n_atoms = mol.GetNumAtoms()
+                        adj = np.zeros((n_atoms, n_atoms), dtype=np.float32)
+                        for bond in mol.GetBonds():
+                            i = bond.GetBeginAtomIdx()
+                            j = bond.GetEndAtomIdx()
+                            adj[i, j] = 1.0
+                            adj[j, i] = 1.0
+                            
+                        conf = mol.GetConformer()
+                        pos = conf.GetPositions()  # (n_atoms, 3)
+                        
+                        y = float(row['pActivity'])
+                        self.data.append((x, adj, pos, y))
+                except Exception:
+                    pass
+                    
+        def __len__(self):
+            return len(self.data)
+            
+        def __getitem__(self, idx):
+            return self.data[idx]
+
+    def collate_bio3d(batch):
+        xs = []
+        adjs = []
+        poses = []
+        ys = []
+        batch_indices = []
+        
+        for mol_idx, (x, adj, pos, y) in enumerate(batch):
+            n_nodes = x.shape[0]
+            xs.append(torch.tensor(x, dtype=torch.float32))
+            adjs.append(torch.tensor(adj, dtype=torch.float32))
+            poses.append(torch.tensor(pos, dtype=torch.float32))
+            ys.append(y)
+            batch_indices.append(torch.full((n_nodes,), mol_idx, dtype=torch.long))
+            
+        x_batch = torch.cat(xs, dim=0)
+        pos_batch = torch.cat(poses, dim=0)
+        batch_indices_batch = torch.cat(batch_indices, dim=0)
+        y_batch = torch.tensor(ys, dtype=torch.float32)
+        
+        total_nodes = x_batch.size(0)
+        adj_batch = torch.zeros((total_nodes, total_nodes), dtype=torch.float32)
+        
+        offset = 0
+        for adj in adjs:
+            n = adj.size(0)
+            adj_batch[offset:offset+n, offset:offset+n] = adj
+            offset += n
+            
+        return x_batch, adj_batch, pos_batch, batch_indices_batch, y_batch
+
+    class CNN3DDataset(Dataset):
+        def __init__(self, X_grid, y):
+            self.X_grid = torch.tensor(X_grid, dtype=torch.float32)
+            self.y = torch.tensor(y, dtype=torch.float32)
+            
+        def __len__(self):
+            return len(self.y)
+            
+        def __getitem__(self, idx):
+            return self.X_grid[idx], self.y[idx]
+
+    class Conv3DModel(nn.Module):
+        def __init__(self, grid_shape):
+            super(Conv3DModel, self).__init__()
+            self.grid_shape = grid_shape
+            self.conv1 = nn.Conv3d(2, 16, kernel_size=3, padding=1)
+            self.pool1 = nn.MaxPool3d(kernel_size=2, stride=2, padding=0)
+            self.conv2 = nn.Conv3d(16, 32, kernel_size=3, padding=1)
+            self.pool2 = nn.MaxPool3d(kernel_size=2, stride=2, padding=0)
+            
+            with torch.no_grad():
+                dummy_x = torch.zeros(1, 2, *grid_shape)
+                x = self.conv1(dummy_x)
+                if x.shape[2] >= 2 and x.shape[3] >= 2 and x.shape[4] >= 2:
+                    x = self.pool1(torch.relu(x))
+                else:
+                    x = torch.relu(x)
+                x = self.conv2(x)
+                if x.shape[2] >= 2 and x.shape[3] >= 2 and x.shape[4] >= 2:
+                    x = self.pool2(torch.relu(x))
+                else:
+                    x = torch.relu(x)
+                self.flat_dim = x.numel()
+                
+            self.fc1 = nn.Linear(self.flat_dim, 64)
+            self.fc2 = nn.Linear(64, 1)
+            
+        def forward(self, x):
+            batch_size = x.size(0)
+            x_reshaped = x.view(batch_size, 2, *self.grid_shape)
+            h = self.conv1(x_reshaped)
+            if h.shape[2] >= 2 and h.shape[3] >= 2 and h.shape[4] >= 2:
+                h = self.pool1(torch.relu(h))
+            else:
+                h = torch.relu(h)
+                
+            h = self.conv2(h)
+            if h.shape[2] >= 2 and h.shape[3] >= 2 and h.shape[4] >= 2:
+                h = self.pool2(torch.relu(h))
+            else:
+                h = torch.relu(h)
+                
+            h = h.view(batch_size, -1)
+            h = torch.relu(self.fc1(h))
+            return self.fc2(h).squeeze(-1)
+
+    class GNN3DConv(nn.Module):
+        def __init__(self, in_dim, out_dim):
+            super(GNN3DConv, self).__init__()
+            self.w_self = nn.Linear(in_dim, out_dim)
+            self.w_neigh = nn.Linear(in_dim, out_dim)
+            
+        def forward(self, x, adj, pos):
+            diff = pos.unsqueeze(1) - pos.unsqueeze(0)  # (N, N, 3)
+            dist = torch.sqrt(torch.sum(diff ** 2, dim=-1) + 1e-6)  # (N, N)
+            weight = adj / (dist + 1.0)
+            deg = torch.sum(weight, dim=1, keepdim=True)
+            weight_norm = weight / (deg + 1e-6)
+            h_self = self.w_self(x)
+            h_neigh = torch.mm(weight_norm, self.w_neigh(x))
+            return torch.relu(h_self + h_neigh)
+
+    class GNN3DModel(nn.Module):
+        def __init__(self, in_features=24, hidden_dim=64, num_layers=3):
+            super(GNN3DModel, self).__init__()
+            self.layers = nn.ModuleList()
+            self.layers.append(GNN3DConv(in_features, hidden_dim))
+            for _ in range(num_layers - 1):
+                self.layers.append(GNN3DConv(hidden_dim, hidden_dim))
+                
+            self.regressor = nn.Sequential(
+                nn.Linear(hidden_dim, 32),
+                nn.ReLU(),
+                nn.Linear(32, 1)
+            )
+            
+        def forward(self, x, adj, pos, batch_indices):
+            h = x
+            for layer in self.layers:
+                h = layer(h, adj, pos)
+                
+            num_mols = int(batch_indices.max().item()) + 1
+            mol_features = []
+            for i in range(num_mols):
+                mask = (batch_indices == i)
+                if mask.sum() > 0:
+                    mol_features.append(h[mask].mean(dim=0))
+                else:
+                    mol_features.append(torch.zeros(h.size(1), device=h.device))
+            pooled = torch.stack(mol_features)
+            return self.regressor(pooled).squeeze(-1)
+
+    class PointNetModel(nn.Module):
+        def __init__(self, in_features=24, hidden_dim=64):
+            super(PointNetModel, self).__init__()
+            self.mlp1 = nn.Sequential(
+                nn.Linear(in_features + 3, hidden_dim),
+                nn.ReLU(),
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.ReLU()
+            )
+            self.mlp2 = nn.Sequential(
+                nn.Linear(hidden_dim, hidden_dim),
+                nn.ReLU(),
+                nn.Linear(hidden_dim, 32),
+                nn.ReLU(),
+                nn.Linear(32, 1)
+            )
+            
+        def forward(self, x, pos, batch_indices):
+            feat = torch.cat([pos, x], dim=1)
+            h = self.mlp1(feat)
+            num_mols = int(batch_indices.max().item()) + 1
+            mol_features = []
+            for i in range(num_mols):
+                mask = (batch_indices == i)
+                if mask.sum() > 0:
+                    mol_features.append(h[mask].max(dim=0)[0])
+                else:
+                    mol_features.append(torch.zeros(h.size(1), device=h.device))
+            pooled = torch.stack(mol_features)
+            return self.mlp2(pooled).squeeze(-1)
+
+    def train_3d_dl(model_type, train_df, grid_shape=None, X_grid_voxels=None, epochs=100, batch_size=32, lr=0.005):
+        if model_type == 'cnn3d':
+            y = train_df['pActivity'].values
+            dataset = CNN3DDataset(X_grid_voxels, y)
+            loader = DataLoader(dataset, batch_size=batch_size, shuffle=True)
+            model = Conv3DModel(grid_shape)
+            optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
+            criterion = nn.MSELoss()
+            model.train()
+            for epoch in range(epochs):
+                for x, y_batch in loader:
+                    optimizer.zero_grad()
+                    pred = model(x)
+                    loss = criterion(pred, y_batch)
+                    loss.backward()
+                    optimizer.step()
+            return model
+        elif model_type in ['gnn3d', 'pointnet']:
+            dataset = Bio3DDataset(train_df)
+            loader = DataLoader(dataset, batch_size=batch_size, shuffle=True, collate_fn=collate_bio3d)
+            if model_type == 'gnn3d':
+                model = GNN3DModel()
+            else:
+                model = PointNetModel()
+            optimizer = optim.Adam(model.parameters(), lr=lr, weight_decay=1e-4)
+            criterion = nn.MSELoss()
+            model.train()
+            for epoch in range(epochs):
+                for x, adj, pos, batch_indices, y_batch in loader:
+                    optimizer.zero_grad()
+                    if model_type == 'gnn3d':
+                        pred = model(x, adj, pos, batch_indices)
+                    else:
+                        pred = model(x, pos, batch_indices)
+                    loss = criterion(pred, y_batch)
+                    loss.backward()
+                    optimizer.step()
+            return model
+        else:
+            raise ValueError(f"Unknown DL model type: {model_type}")
+
+    def predict_3d_dl(model_type, model, df, X_grid_voxels=None, batch_size=32):
+        model.eval()
+        if model_type == 'cnn3d':
+            y = np.zeros(len(df))
+            dataset = CNN3DDataset(X_grid_voxels, y)
+            loader = DataLoader(dataset, batch_size=batch_size, shuffle=False)
+            preds = []
+            with torch.no_grad():
+                for x, _ in loader:
+                    pred = model(x)
+                    preds.extend(pred.cpu().numpy().tolist())
+            return np.array(preds)
+        elif model_type in ['gnn3d', 'pointnet']:
+            dataset = Bio3DDataset(df)
+            loader = DataLoader(dataset, batch_size=batch_size, shuffle=False, collate_fn=collate_bio3d)
+            preds = []
+            with torch.no_grad():
+                for x, adj, pos, batch_indices, _ in loader:
+                    if model_type == 'gnn3d':
+                        pred = model(x, adj, pos, batch_indices)
+                    else:
+                        pred = model(x, pos, batch_indices)
+                    preds.extend(pred.cpu().numpy().tolist())
+            return np.array(preds)
+        else:
+            raise ValueError(f"Unknown DL model type: {model_type}")
+
 
 # ==========================================
 # 7. MODEL EVALUATION & STATISTICS
 # ==========================================
 
-def calculate_q2(model_type, X_train, y_train, train_df=None):
+def calculate_q2(model_type, X_train, y_train, train_df=None, grid_shape=None, X_grid_voxels_train=None):
     """
     Computes 5-fold cross-validated Q^2.
     """
@@ -575,9 +1144,25 @@ def calculate_q2(model_type, X_train, y_train, train_df=None):
             fold_train = train_df.iloc[train_idx]
             fold_val = train_df.iloc[val_idx]
             
-            # Train GNN on fold train
             net = train_gnn(fold_train, epochs=80, batch_size=32, lr=0.005)
             preds = predict_gnn(net, fold_val)
+            cv_preds[val_idx] = preds
+        return r2_score(y_train, cv_preds)
+    elif model_type in ['cnn3d', 'gnn3d', 'pointnet']:
+        if not TORCH_AVAILABLE:
+            return 0.0
+        cv_preds = np.zeros(len(train_df))
+        for train_idx, val_idx in kf.split(train_df):
+            fold_train = train_df.iloc[train_idx]
+            fold_val = train_df.iloc[val_idx]
+            if model_type == 'cnn3d':
+                voxels_fold_train = X_grid_voxels_train[train_idx]
+                voxels_fold_val = X_grid_voxels_train[val_idx]
+                net = train_3d_dl('cnn3d', fold_train, grid_shape=grid_shape, X_grid_voxels=voxels_fold_train, epochs=30, batch_size=32, lr=0.005)
+                preds = predict_3d_dl('cnn3d', net, fold_val, X_grid_voxels=voxels_fold_val)
+            else:
+                net = train_3d_dl(model_type, fold_train, epochs=30, batch_size=32, lr=0.005)
+                preds = predict_3d_dl(model_type, net, fold_val)
             cv_preds[val_idx] = preds
         return r2_score(y_train, cv_preds)
     else:
@@ -586,7 +1171,7 @@ def calculate_q2(model_type, X_train, y_train, train_df=None):
         cv_preds = cross_val_predict(reg, X_train, y_train, cv=kf)
         return r2_score(y_train, cv_preds)
 
-def calculate_y_randomization(model_type, X_train, y_train, train_df=None, n_runs=50):
+def calculate_y_randomization(model_type, X_train, y_train, train_df=None, n_runs=50, grid_shape=None, X_grid_voxels_train=None):
     """
     Performs Y-randomization test to evaluate chance correlation.
     """
@@ -600,16 +1185,12 @@ def calculate_y_randomization(model_type, X_train, y_train, train_df=None, n_run
         y_shuffled = np.random.permutation(y_train)
         
         if model_type == 'gnn':
-            # Create a copy of df with shuffled activity
             df_shuffled = train_df.copy()
             df_shuffled['pActivity'] = y_shuffled
-            
-            # Fast train (fewer epochs for randomization runs)
             net = train_gnn(df_shuffled, epochs=40, batch_size=32, lr=0.005)
             preds = predict_gnn(net, df_shuffled)
             r2 = r2_score(y_shuffled, preds)
             
-            # Q2 CV
             cv_preds = np.zeros(len(df_shuffled))
             for train_idx, val_idx in kf.split(df_shuffled):
                 fold_train = df_shuffled.iloc[train_idx]
@@ -617,10 +1198,33 @@ def calculate_y_randomization(model_type, X_train, y_train, train_df=None, n_run
                 fold_net = train_gnn(fold_train, epochs=30, batch_size=32, lr=0.005)
                 cv_preds[val_idx] = predict_gnn(fold_net, fold_val)
             q2 = r2_score(y_shuffled, cv_preds)
+        elif model_type in ['cnn3d', 'gnn3d', 'pointnet']:
+            df_shuffled = train_df.copy()
+            df_shuffled['pActivity'] = y_shuffled
+            if model_type == 'cnn3d':
+                net = train_3d_dl('cnn3d', df_shuffled, grid_shape=grid_shape, X_grid_voxels=X_grid_voxels_train, epochs=20, batch_size=32, lr=0.005)
+                preds = predict_3d_dl('cnn3d', net, df_shuffled, X_grid_voxels=X_grid_voxels_train)
+            else:
+                net = train_3d_dl(model_type, df_shuffled, epochs=20, batch_size=32, lr=0.005)
+                preds = predict_3d_dl(model_type, net, df_shuffled)
+            r2 = r2_score(y_shuffled, preds)
+            
+            cv_preds = np.zeros(len(df_shuffled))
+            for train_idx, val_idx in kf.split(df_shuffled):
+                fold_train = df_shuffled.iloc[train_idx]
+                fold_val = df_shuffled.iloc[val_idx]
+                if model_type == 'cnn3d':
+                    voxels_fold_train = X_grid_voxels_train[train_idx]
+                    voxels_fold_val = X_grid_voxels_train[val_idx]
+                    fold_net = train_3d_dl('cnn3d', fold_train, grid_shape=grid_shape, X_grid_voxels=voxels_fold_train, epochs=15, batch_size=32, lr=0.005)
+                    cv_preds[val_idx] = predict_3d_dl('cnn3d', fold_net, fold_val, X_grid_voxels=voxels_fold_val)
+                else:
+                    fold_net = train_3d_dl(model_type, fold_train, epochs=15, batch_size=32, lr=0.005)
+                    cv_preds[val_idx] = predict_3d_dl(model_type, fold_net, fold_val)
+            q2 = r2_score(y_shuffled, cv_preds)
         else:
             reg = get_regressor(model_type, X_train)
             if hasattr(reg, 'estimator'):  # GridSearchCV wrapper
-                # Fit the base estimator with best parameters found to speed up
                 reg.fit(X_train, y_train)
                 best_model = reg.best_estimator_
                 best_model.fit(X_train, y_shuffled)
@@ -643,7 +1247,7 @@ def calculate_y_randomization(model_type, X_train, y_train, train_df=None, n_run
     
     return ran_r2s, ran_q2s, best_ran_r2, best_ran_q2
 
-def evaluate_qsar_model(model_type, X_train, y_train, X_test, y_test, train_df=None, test_df=None, k=0, y_rand_runs=50):
+def evaluate_qsar_model(model_type, X_train, y_train, X_test, y_test, train_df=None, test_df=None, k=0, y_rand_runs=50, grid_shape=None, X_grid_voxels_train=None, X_grid_voxels_test=None):
     """
     Computes all statistical metrics required for QSAR model evaluation.
     """
@@ -656,10 +1260,16 @@ def evaluate_qsar_model(model_type, X_train, y_train, X_test, y_test, train_df=N
     if model_type == 'gnn':
         if not TORCH_AVAILABLE:
             raise RuntimeError("PyTorch is not available. Install PyTorch to run GNN model.")
-        # Train final GNN
         net = train_gnn(train_df, epochs=150, batch_size=32, lr=0.005)
         train_pred = predict_gnn(net, train_df)
         test_pred = predict_gnn(net, test_df)
+        model_object = net
+    elif model_type in ['cnn3d', 'gnn3d', 'pointnet']:
+        if not TORCH_AVAILABLE:
+            raise RuntimeError("PyTorch is not available. Install PyTorch to run Deep Learning model.")
+        net = train_3d_dl(model_type, train_df, grid_shape=grid_shape, X_grid_voxels=X_grid_voxels_train, epochs=100, batch_size=32, lr=0.005)
+        train_pred = predict_3d_dl(model_type, net, train_df, X_grid_voxels=X_grid_voxels_train)
+        test_pred = predict_3d_dl(model_type, net, test_df, X_grid_voxels=X_grid_voxels_test)
         model_object = net
     else:
         reg = get_regressor(model_type, X_train)
@@ -670,7 +1280,7 @@ def evaluate_qsar_model(model_type, X_train, y_train, X_test, y_test, train_df=N
         
     # 2. Compute training R2 and Q2
     r2 = r2_score(y_train, train_pred)
-    q2 = calculate_q2(model_type, X_train, y_train, train_df=train_df)
+    q2 = calculate_q2(model_type, X_train, y_train, train_df=train_df, grid_shape=grid_shape, X_grid_voxels_train=X_grid_voxels_train)
     
     # 3. Compute external test set metrics (Tropsha's pred_R2)
     # pred_R2 = 1 - sum(y_test - pred_test)^2 / sum(y_test - mean_train)^2
@@ -692,7 +1302,7 @@ def evaluate_qsar_model(model_type, X_train, y_train, X_test, y_test, train_df=N
         
     # 6. Y-randomization
     ran_r2s, ran_q2s, best_ran_r2, best_ran_q2 = calculate_y_randomization(
-        model_type, X_train, y_train, train_df=train_df, n_runs=y_rand_runs
+        model_type, X_train, y_train, train_df=train_df, n_runs=y_rand_runs, grid_shape=grid_shape, X_grid_voxels_train=X_grid_voxels_train
     )
     
     # Z-score of real R2 compared to randomized R2s
@@ -813,29 +1423,81 @@ def run_prediction(predict_csv, model_path, smiles_col, out_dir):
     pred_df['MolObject'] = mol_objects
     
     # Perform prediction based on model type
-    if model_name != 'gnn':
-        print("Generating molecular descriptors for predictions...")
-        desc_df = generate_descriptors(pred_df, use_fingerprints=use_fingerprints)
+    qsar_type = model_data.get('qsar_type', '2d')
+    if qsar_type == '3d':
+        print("Generating 3D conformers for prediction compounds...")
+        conformers = []
+        valid_idx_3d = []
+        for idx, row in pred_df.iterrows():
+            mol_3d = generate_3d_conformer(row['MolObject'])
+            if mol_3d is not None:
+                conformers.append(mol_3d)
+                valid_idx_3d.append(idx)
         
-        # Align features
-        missing_features = [f for f in selected_features if f not in desc_df.columns]
-        if missing_features:
-            for f in missing_features:
-                desc_df[f] = 0.0
-        X = desc_df[selected_features]
-        
-        # Predict
-        preds = model_object.predict(X)
-        if len(preds.shape) > 1 and preds.shape[1] == 1:
-            preds = preds.squeeze(-1)
-    else:
-        if not TORCH_AVAILABLE:
-            print("Error: PyTorch is required to run predictions with the GNN model.")
+        if not conformers:
+            print("Error: Conformer generation failed for all prediction compounds.")
             sys.exit(1)
-        print("Running GNN forward pass predictions...")
-        pred_df['pActivity'] = 0.0  # Dummy label needed for loader
-        preds = predict_gnn(model_object, pred_df)
+            
+        print(f"Successfully generated 3D conformers for {len(conformers)} / {len(valid_indices)} prediction compounds.")
+        pred_df = df.loc[valid_idx_3d].copy()
+        pred_df['Clean_SMILES'] = [cleaned_smiles_list[valid_indices.index(idx)] for idx in valid_idx_3d]
+        pred_df['MolObject'] = conformers
         
+        ref_mol = model_data.get('ref_mol', None)
+        if ref_mol is not None:
+            print("Aligning 3D conformers to reference template molecule...")
+            pred_df['MolObject'] = align_molecules_3d(pred_df['MolObject'].tolist(), ref_mol)
+            
+        if model_name in ['cnn3d', 'gnn3d', 'pointnet']:
+            if not TORCH_AVAILABLE:
+                print(f"Error: PyTorch is required to run predictions with {model_name.upper()} model.")
+                sys.exit(1)
+            if model_name == 'cnn3d':
+                grid_bounds = model_data.get('grid_bounds', None)
+                grid_coords = reconstruct_grid(grid_bounds)
+                _, X_grid_voxels = generate_3d_descriptors(pred_df, grid_coords, include_grid_free=False)
+                preds = predict_3d_dl('cnn3d', model_object, pred_df, X_grid_voxels=X_grid_voxels)
+            else:
+                pred_df['pActivity'] = 0.0
+                preds = predict_3d_dl(model_name, model_object, pred_df)
+        else:
+            grid_bounds = model_data.get('grid_bounds', None)
+            grid_coords = reconstruct_grid(grid_bounds)
+            include_grid_free = model_data.get('include_grid_free', False)
+            desc_df, _ = generate_3d_descriptors(pred_df, grid_coords, include_grid_free=include_grid_free)
+            
+            missing_features = [f for f in selected_features if f not in desc_df.columns]
+            if missing_features:
+                for f in missing_features:
+                    desc_df[f] = 0.0
+            X = desc_df[selected_features]
+            
+            preds = model_object.predict(X)
+            if len(preds.shape) > 1 and preds.shape[1] == 1:
+                preds = preds.squeeze(-1)
+    else:
+        # 2D QSAR predictions
+        if model_name != 'gnn':
+            print("Generating molecular descriptors for predictions...")
+            desc_df = generate_descriptors(pred_df, use_fingerprints=use_fingerprints)
+            
+            missing_features = [f for f in selected_features if f not in desc_df.columns]
+            if missing_features:
+                for f in missing_features:
+                    desc_df[f] = 0.0
+            X = desc_df[selected_features]
+            
+            preds = model_object.predict(X)
+            if len(preds.shape) > 1 and preds.shape[1] == 1:
+                preds = preds.squeeze(-1)
+        else:
+            if not TORCH_AVAILABLE:
+                print("Error: PyTorch is required to run predictions with the GNN model.")
+                sys.exit(1)
+            print("Running GNN forward pass predictions...")
+            pred_df['pActivity'] = 0.0  # Dummy label needed for loader
+            preds = predict_gnn(model_object, pred_df)
+            
     # Append predictions
     pred_df['Predicted_pIC50'] = preds
     pred_df['Predicted_IC50_nM'] = 10 ** (9.0 - preds)
@@ -872,9 +1534,12 @@ def main():
     parser.add_argument('--data', type=str, help="Path to raw CSV dataset")
     parser.add_argument('--smiles', type=str, help="Column name containing SMILES strings")
     parser.add_argument('--activity', type=str, help="Column name containing activity values (nM)")
+    parser.add_argument('--qsar_type', type=str, default='2d',
+                        choices=['2d', '3d'],
+                        help="QSAR type: 2d (standard chemical descriptors) or 3d (conformers, grid, shapes)")
     parser.add_argument('--model', type=str, default='pls', 
-                        choices=['mlr', 'pls', 'rf', 'svr', 'xgb', 'gnn'], 
-                        help="Model selection: mlr, pls, rf, svr, xgb, gnn")
+                        choices=['mlr', 'pls', 'rf', 'svr', 'xgb', 'gnn', 'cnn3d', 'gnn3d', 'pointnet'], 
+                        help="Model selection: mlr, pls, rf, svr, xgb, gnn, cnn3d, gnn3d, pointnet")
     parser.add_argument('--split', type=str, default='pca', 
                         choices=['random', 'pca'], 
                         help="Data splitting method: random, pca (Kennard-Stone)")
@@ -882,7 +1547,7 @@ def main():
     parser.add_argument('--var_thresh', type=float, default=0.01, help="Variance filter threshold")
     parser.add_argument('--corr_thresh', type=float, default=0.85, help="Collinearity correlation limit")
     parser.add_argument('--y_rand_runs', type=int, default=50, help="Number of Y-randomization iterations")
-    parser.add_argument('--fingerprints', action='store_true', help="Use 2D fingerprints (Morgan + MACCS)")
+    parser.add_argument('--fingerprints', action='store_true', help="Use 2D fingerprints (Morgan + MACCS) - 2D QSAR only")
     parser.add_argument('--out_dir', type=str, default='qsar_output', help="Directory to save output files and plots")
     
     # Prediction arguments
@@ -908,9 +1573,19 @@ def main():
         print("To predict new compounds instead, use: cagqsar --predict <csv_file> --model_path <pkl_file> --smiles <column>")
         sys.exit(1)
         
-    # Check PyTorch dependency for GNN
-    if args.model == 'gnn' and not TORCH_AVAILABLE:
-        print("Error: PyTorch is not installed. GNN model cannot be run. Please install PyTorch first.")
+    # Validate qsar_type and model compatibility
+    if args.qsar_type == '2d':
+        if args.model in ['cnn3d', 'gnn3d', 'pointnet']:
+            print(f"Error: Model '{args.model}' is a 3D model, but --qsar_type is set to '2d'.")
+            sys.exit(1)
+    elif args.qsar_type == '3d':
+        if args.model == 'gnn':
+            print("Error: Model 'gnn' is a 2D graph model. For 3D graph QSAR, please select 'gnn3d'.")
+            sys.exit(1)
+            
+    # Check PyTorch dependency for DL models
+    if args.model in ['gnn', 'cnn3d', 'gnn3d', 'pointnet'] and not TORCH_AVAILABLE:
+        print(f"Error: PyTorch is not installed. Model '{args.model}' cannot be run. Please install PyTorch first.")
         sys.exit(1)
         
     os.makedirs(args.out_dir, exist_ok=True)
@@ -935,42 +1610,120 @@ def main():
     curated_df.to_csv(cleaned_csv_path, index=False)
     print(f"Cleaned curated dataset saved to: {cleaned_csv_path}")
     
-    # Step 2: Descriptor Generation (For non-GNN models)
-    if args.model != 'gnn':
-        X = generate_descriptors(curated_df, use_fingerprints=args.fingerprints)
-        y = curated_df['pActivity'].values
+    # Step 2: 2D or 3D QSAR Workflow Configuration
+    ref_mol = None
+    grid_bounds = None
+    X_grid_voxels_train = None
+    X_grid_voxels_test = None
+    grid_shape = None
+    include_grid_free = False
+    X_selected = None
+    
+    if args.qsar_type == '3d':
+        # Step 2.1: 3D Conformer Generation
+        print("Generating 3D conformers for curated structures...")
+        conformers = []
+        valid_indices_3d = []
+        for idx, row in curated_df.iterrows():
+            mol_3d = generate_3d_conformer(row['MolObject'])
+            if mol_3d is not None:
+                conformers.append(mol_3d)
+                valid_indices_3d.append(idx)
         
-        # Step 3: Feature Selection (Variance, Correlation, LassoCV)
-        # Apply n/5 statistical rule: limit descriptors to at most n_train / 5
-        n_est_train = int(len(y) * (1.0 - args.test_size))
-        max_k = int(n_est_train / 5)
-        X_selected = select_features(X, y, var_thresh=args.var_thresh, corr_thresh=args.corr_thresh, max_k=max_k)
-        
-        if X_selected.shape[1] == 0:
-            print("Error: All descriptors dropped by feature selection filters.")
+        if not conformers:
+            print("Error: Conformer generation failed for all curated molecules.")
             sys.exit(1)
             
-        # Step 4: Data Splitting (Random or PCA Kennard-Stone)
-        train_idx, test_idx = split_dataset(X_selected, y, method=args.split, test_size=args.test_size)
+        print(f"Successfully generated 3D conformers for {len(conformers)} / {len(curated_df)} compounds.")
+        curated_df = curated_df.iloc[valid_indices_3d].copy()
+        curated_df['MolObject'] = conformers
         
-        X_train, X_test = X_selected.iloc[train_idx], X_selected.iloc[test_idx]
-        y_train, y_test = y[train_idx], y[test_idx]
+        # Step 2.2: 3D Molecular Scaffold Alignment
+        # Find template: the molecule with the highest pActivity
+        ref_idx = curated_df['pActivity'].idxmax()
+        ref_mol = curated_df.loc[ref_idx, 'MolObject']
+        ref_smiles = curated_df.loc[ref_idx, 'Clean_SMILES']
+        print(f"Selected reference molecule (highest activity) for 3D alignment: {ref_smiles}")
         
-        train_df_sub, test_df_sub = None, None
-        k_count = X_train.shape[1]
+        aligned_mols = align_molecules_3d(curated_df['MolObject'].tolist(), ref_mol)
+        curated_df['MolObject'] = aligned_mols
+        
+        # Step 2.3: 3D Descriptor Calculation & Splitting
+        if args.model not in ['gnn3d', 'pointnet']:
+            # Define 3D Grid
+            grid_coords, grid_shape, grid_bounds = define_grid(curated_df['MolObject'].tolist())
+            print(f"Generated 3D grid of shape {grid_shape} containing {len(grid_coords)} points.")
+            
+            # Compute 3D descriptors
+            include_grid_free = args.model in ['mlr', 'rf', 'svr', 'xgb']
+            X, X_grid_voxels = generate_3d_descriptors(curated_df, grid_coords, include_grid_free=include_grid_free)
+            y = curated_df['pActivity'].values
+            
+            if args.model == 'cnn3d':
+                # Splitting dataset using PCA on grid features
+                scaler = StandardScaler()
+                X_scaled = scaler.fit_transform(X)
+                train_idx, test_idx = split_dataset(pd.DataFrame(X_scaled), y, method=args.split, test_size=args.test_size)
+                
+                X_train, X_test = None, None
+                y_train, y_test = y[train_idx], y[test_idx]
+                train_df_sub = curated_df.iloc[train_idx]
+                test_df_sub = curated_df.iloc[test_idx]
+                X_grid_voxels_train = X_grid_voxels[train_idx]
+                X_grid_voxels_test = X_grid_voxels[test_idx]
+                k_count = 0
+            else:
+                # Classical models: run feature selection
+                n_est_train = int(len(y) * (1.0 - args.test_size))
+                max_k = int(n_est_train / 5)
+                X_selected = select_features(X, y, var_thresh=args.var_thresh, corr_thresh=args.corr_thresh, max_k=max_k)
+                
+                if X_selected.shape[1] == 0:
+                    print("Error: All descriptors dropped by feature selection filters.")
+                    sys.exit(1)
+                    
+                train_idx, test_idx = split_dataset(X_selected, y, method=args.split, test_size=args.test_size)
+                X_train, X_test = X_selected.iloc[train_idx], X_selected.iloc[test_idx]
+                y_train, y_test = y[train_idx], y[test_idx]
+                train_df_sub, test_df_sub = None, None
+                k_count = X_train.shape[1]
+        else:
+            # GNN3D / PointNet
+            y = curated_df['pActivity'].values
+            train_idx, test_idx = split_dataset(curated_df[['Clean_SMILES']], y, method='random', test_size=args.test_size)
+            train_df_sub = curated_df.iloc[train_idx]
+            test_df_sub = curated_df.iloc[test_idx]
+            y_train, y_test = y[train_idx], y[test_idx]
+            X_train, X_test = None, None
+            k_count = 0
     else:
-        # GNN uses molecular graphs directly, not tabular descriptors
-        y = curated_df['pActivity'].values
-        train_idx, test_idx = split_dataset(curated_df[['Clean_SMILES']], y, method='random', test_size=args.test_size)
-        
-        train_df_sub = curated_df.iloc[train_idx]
-        test_df_sub = curated_df.iloc[test_idx]
-        y_train, y_test = y[train_idx], y[test_idx]
-        
-        X_train, X_test = None, None
-        # k is set to 0 dynamically for neural models or the node feature dimensions
-        k_count = 0
-        
+        # 2D QSAR Flow
+        if args.model != 'gnn':
+            X = generate_descriptors(curated_df, use_fingerprints=args.fingerprints)
+            y = curated_df['pActivity'].values
+            
+            n_est_train = int(len(y) * (1.0 - args.test_size))
+            max_k = int(n_est_train / 5)
+            X_selected = select_features(X, y, var_thresh=args.var_thresh, corr_thresh=args.corr_thresh, max_k=max_k)
+            
+            if X_selected.shape[1] == 0:
+                print("Error: All descriptors dropped by feature selection filters.")
+                sys.exit(1)
+                
+            train_idx, test_idx = split_dataset(X_selected, y, method=args.split, test_size=args.test_size)
+            X_train, X_test = X_selected.iloc[train_idx], X_selected.iloc[test_idx]
+            y_train, y_test = y[train_idx], y[test_idx]
+            train_df_sub, test_df_sub = None, None
+            k_count = X_train.shape[1]
+        else:
+            y = curated_df['pActivity'].values
+            train_idx, test_idx = split_dataset(curated_df[['Clean_SMILES']], y, method='random', test_size=args.test_size)
+            train_df_sub = curated_df.iloc[train_idx]
+            test_df_sub = curated_df.iloc[test_idx]
+            y_train, y_test = y[train_idx], y[test_idx]
+            X_train, X_test = None, None
+            k_count = 0
+            
     # Check sample size limit
     if len(y_train) <= 20:
         print(f"Warning: Training set has only {len(y_train)} molecules. QSAR models statistically require > 20 molecules.")
@@ -978,7 +1731,8 @@ def main():
     # Step 5 & 6: Model Building & Evaluation
     metrics, train_pred, test_pred, model_object = evaluate_qsar_model(
         args.model, X_train, y_train, X_test, y_test,
-        train_df=train_df_sub, test_df=test_df_sub, k=k_count, y_rand_runs=args.y_rand_runs
+        train_df=train_df_sub, test_df=test_df_sub, k=k_count, y_rand_runs=args.y_rand_runs,
+        grid_shape=grid_shape, X_grid_voxels_train=X_grid_voxels_train, X_grid_voxels_test=X_grid_voxels_test
     )
     
     # Save the trained model file (dictionary state)
@@ -986,8 +1740,12 @@ def main():
     model_data = {
         'model_object': model_object,
         'model_name': args.model,
-        'selected_features': X_selected.columns.tolist() if args.model != 'gnn' else None,
-        'use_fingerprints': args.fingerprints
+        'qsar_type': args.qsar_type,
+        'ref_mol': ref_mol if args.qsar_type == '3d' else None,
+        'grid_bounds': grid_bounds if (args.qsar_type == '3d' and args.model in ['mlr', 'pls', 'rf', 'svr', 'xgb', 'cnn3d']) else None,
+        'selected_features': X_selected.columns.tolist() if X_selected is not None else None,
+        'use_fingerprints': args.fingerprints if args.qsar_type == '2d' else False,
+        'include_grid_free': include_grid_free if args.qsar_type == '3d' else False
     }
     with open(model_path, 'wb') as f:
         pickle.dump(model_data, f)

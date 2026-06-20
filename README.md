@@ -66,29 +66,46 @@ cagqsar --data <dataset_csv> --smiles <smiles_column> --activity <activity_colum
 * `--data`: Path to the CSV dataset (Required).
 * `--smiles`: Column name containing SMILES strings (Required).
 * `--activity`: Column name containing activities in nM (Required).
-* `--model`: Regression algorithm to train: `mlr` (MLR), `pls` (PLS), `rf` (Random Forest), `svr` (SVM), `xgb` (XGBoost), or `gnn` (Graph Neural Network) (Default: `pls`).
-* `--split`: Splitting method: `random` or `pca` (Kennard-Stone PCA-distance split) (Default: `pca`).
+* `--qsar_type`: Type of modeling: `2d` (standard descriptors + fingerprints) or `3d` (conformers, aligned grids, shape fields) (Default: `2d`).
+* `--model`: Regression algorithm to train:
+  - For `2d` QSAR: `mlr`, `pls`, `rf`, `svr`, `xgb`, `gnn`
+  - For `3d` QSAR: `mlr`, `pls`, `rf`, `svr`, `xgb`, `cnn3d` (3D CNN), `gnn3d` (3D GNN), `pointnet` (Point Cloud Net)
+* `--split`: Splitting method: `random` or `pca` (Kennard-Stone split) (Default: `pca`).
 * `--test_size`: Fraction of data allocated to the test set (Default: `0.2`).
 * `--var_thresh`: Variance filter threshold for dropping constant descriptors (Default: `0.01`).
 * `--corr_thresh`: Correlation threshold for collinearity filter (Default: `0.85`).
 * `--y_rand_runs`: Number of Y-randomization validation loops (Default: `50`).
-* `--fingerprints`: Flag to compute 2D fingerprints (Morgan/ECFP + MACCS keys) in addition to physical descriptors.
+* `--fingerprints`: Flag to compute 2D fingerprints (Morgan/ECFP + MACCS keys) - 2D QSAR only.
 * `--out_dir`: Directory to export curated data, model reports, trained model binaries, and evaluation plots (Default: `qsar_output`).
 
 ---
 
 ## Programmatic Import in Python
 
-Once the package is installed, you can import and use any of its internal logic (like the structure curator or descriptor calculator) in your own scripts:
+Once the package is installed, you can import and use any of its internal logic in your own scripts:
 
 ```python
-from cagqsar import curate_molecule, get_rdkit_descriptors
+from rdkit import Chem
+from cagqsar import (
+    curate_molecule, 
+    get_rdkit_descriptors, 
+    generate_3d_conformer, 
+    align_molecules_3d, 
+    generate_3d_descriptors
+)
 
 # 1. Clean a SMILES structure and remove salt fragments
-clean_smiles, mol = curate_molecule("CN(C)C(=O)c1ccccc1.Cl", Chem.SaltRemover.SaltRemover())
+remover = Chem.SaltRemover.SaltRemover()
+clean_smiles, mol = curate_molecule("CN(C)C(=O)c1ccccc1.Cl", remover)
 
-# 2. Extract standard RDKit descriptors
+# 2. Extract standard 2D RDKit descriptors
 descriptors = get_rdkit_descriptors(mol)
+
+# 3. Generate a 3D conformer and optimize geometry (for 3D QSAR)
+mol_3d = generate_3d_conformer(mol)
+
+# 4. Align molecule to a reference coordinate template
+aligned_mols = align_molecules_3d([mol_3d], ref_mol=template_mol)
 ```
 
 ---
