@@ -22,8 +22,8 @@ After publishing the package to PyPI, you can create a virtual environment and i
 python3 -m venv qsar_env
 source qsar_env/bin/activate
 
-# 2. Install the package from PyPI
-pip install cagqsar
+# 2. Install (or upgrade to) the latest version from PyPI
+pip install --upgrade cagqsar
 
 # 3. Run the CLI tool
 cagqsar --help
